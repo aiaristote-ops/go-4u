@@ -1,0 +1,217 @@
+name: win 11
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-setup:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Download and extract Ngrok
+        shell: powershell
+        run: |
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-stable-windows-amd64.zip" -OutFile ngrok.zip -UseBasicParsing
+          Expand-Archive ngrok.zip -DestinationPath "$env:USERPROFILE" -Force
+          Remove-Item ngrok.zip -Force
+          Copy-Item "$env:USERPROFILE\ngrok.exe" "$env:GITHUB_WORKSPACE\ngrok.exe" -Force
+
+      - name: Authenticate Ngrok
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\ngrok.exe config add-authtoken "${{ secrets.NGROK_AUTH_TOKEN }}"
+
+      - name: Enable RDP and Firewall
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0 -Force
+
+          # speed / stability
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "KeepAliveEnable" -Value 1 -Force
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "KeepAliveInterval" -Value 1 -Force
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fDisableUDP" -Value 1 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "MaxIdleTime" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "MaxDisconnectionTime" -Value 0 -Force
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "Allow RDP via Ngrok" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -ErrorAction SilentlyContinue
+
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+
+      - name: Create Admin User
+        shell: powershell
+        run: |
+          $pass = "MR.English2008"
+          net user RDP $pass /add /expires:never 2>$null
+          net localgroup administrators RDP /add 2>$null
+          net localgroup "Remote Desktop Users" RDP /add 2>$null
+          net user RDP /active:yes
+
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
+          Write-Host "User RDP created"
+
+      - name: Start Ngrok Tunnel
+        shell: powershell
+        run: |
+          Start-Process -FilePath "$pwd\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -NoNewWindow -RedirectStandardOutput ngrok.log -RedirectStandardError ngrok.err
+
+          $tunnelUrl = $null
+          $timeout = 60
+
+          while ($timeout -gt 0 -and -not $tunnelUrl) {
+            Start-Sleep -Seconds 5
+            $timeout -= 5
+            try {
+              $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
+              $tunnelUrl = $response.tunnels[[0].public_url -replace "tcp://", ""
+            } catch {
+              $logContent = Get-Content ngrok.log -ErrorAction SilentlyContinue
+              $match = $logContent | Select-String -Pattern "tcp://([a-zA-Z0-9\.\-]+:\d+)" | Select-Object -First 1
+              if ($match) { $tunnelUrl = $match.Matches.Groups[1].Value }
+            }
+          }
+
+          if (-not $tunnelUrl) {
+            Write-Host "--- ngrok.log ---"
+            Get-Content ngrok.log -ErrorAction SilentlyContinue
+            Write-Host "--- ngrok.err ---"
+            Get-Content ngrok.err -ErrorAction SilentlyContinue
+            Write-Output "::error::Ngrok tunnel could not be established"
+            exit 1
+          }
+
+          echo "NGROK_ADDR=$tunnelUrl" >> $env:GITHUB_ENV
+
+          Write-Output "============================================"
+          Write-Output "||     RDP CONNECTION DETAILS             ||"
+          Write-Output "============================================"
+          Write-Output "Address  : $tunnelUrl"
+          Write-Output "Username : RDP"
+          Write-Output "Password : MR.English2008"
+          Write-Output "============================================"
+
+      - name: Background Gofile Backup + Keep Alive
+        shell: powershell
+        run: |
+          $token    = "${{ secrets.GOFILE_TOKEN }}"
+          $folderId = "${{ secrets.GOFILE_FOLDER_ID }}"
+
+          $backupRoot = "C:\Users\RDP"
+          $watchFolders = @(
+              "$backupRoot\Desktop",
+              "$backupRoot\Documents",
+              "$backupRoot\Downloads"
+          )
+
+          $stateFile = "C:\gofile_state.txt"
+          if (-not (Test-Path $stateFile)) { "" | Set-Content $stateFile }
+
+          function Get-GofileServer {
+              try {
+                  $r = Invoke-RestMethod -Uri "https://api.gofile.io/servers" -Method Get
+                  return $r.data.servers[0].name
+              } catch { return "store1" }
+          }
+
+          function Upload-ToGofile {
+              param([string]$zipPath)
+              if (-not $token) {
+                  Write-Host "GOFILE_TOKEN empty - skip upload"
+                  return $null
+              }
+              $server = Get-GofileServer
+              $uri = "https://$server.gofile.io/contents/uploadfile"
+              $form = @{
+                  file  = Get-Item -Path $zipPath
+                  token = $token
+              }
+              if ($folderId) { $form["folderId"] = $folderId }
+              try {
+                  $resp = Invoke-RestMethod -Uri $uri -Method Post -Form $form
+                  if ($resp.status -eq "ok") { return $resp.data }
+                  Write-Host "Upload failed: $($resp.status)"
+                  return $null
+              } catch {
+                  Write-Host "Upload exception: $($_.Exception.Message)"
+                  return $null
+              }
+          }
+
+          function Delete-GofileContent {
+              param([string]$contentId)
+              if (-not $token -or -not $contentId) { return }
+              try {
+                  $body = @{ contentsId = $contentId; token = $token } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "https://api.gofile.io/contents" -Method Delete -Body $body -ContentType "application/json" | Out-Null
+                  Write-Host "Old backup $contentId deleted"
+              } catch {
+                  Write-Host "Delete failed (ignored)"
+              }
+          }
+
+          function Do-Backup {
+              $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+              $zip   = "C:\backup-$stamp.zip"
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Starting backup -> $zip"
+
+              $toZip = @()
+              foreach ($f in $watchFolders) {
+                  if (Test-Path $f) { $toZip += $f }
+              }
+              if ($toZip.Count -eq 0) {
+                  Write-Host "Nothing to backup yet"
+                  return
+              }
+
+              try {
+                  Compress-Archive -Path $toZip -DestinationPath $zip -Force -CompressionLevel Optimal
+              } catch {
+                  Write-Host "Zip failed: $($_.Exception.Message)"
+                  return
+              }
+
+              $data = Upload-ToGofile -zipPath $zip
+              Remove-Item $zip -Force -ErrorAction SilentlyContinue
+
+              if ($data) {
+                  Write-Host "Uploaded: $($data.downloadPage)  (id=$($data.fileId))"
+                  $oldId = Get-Content $stateFile -ErrorAction SilentlyContinue
+                  if ($oldId) { Delete-GofileContent -contentId $oldId }
+                  $data.fileId | Set-Content $stateFile
+              }
+          }
+
+          $startTime     = Get-Date
+          $nextBackup    = $startTime.AddHours(2)
+          $finalBackupAt = $startTime.AddMinutes(245)
+          $didFinal      = $false
+
+          while ($true) {
+              $now = Get-Date
+              Write-Host "[$($now.ToString('HH:mm:ss'))] RDP live - next backup $($nextBackup.ToString('HH:mm:ss'))"
+
+              if ($now -ge $nextBackup) {
+                  Do-Backup
+                  $nextBackup = $now.AddHours(2)
+              }
+
+              if (-not $didFinal -and $now -ge $finalBackupAt) {
+                  Write-Host "Final backup window reached"
+                  Do-Backup
+                  $didFinal = $true
+              }
+
+              Start-Sleep -Seconds 300
+          }
+
+      - name: Cleanup Ngrok
+        if: always()
+        shell: powershell
+        run: |
+          Stop-Process -Name "ngrok" -Force -ErrorAction SilentlyContinue
